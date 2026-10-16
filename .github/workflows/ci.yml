@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: shellcheck & unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: shellcheck dragonfly-s3-sync test/*.sh
+
+      # Runs inside the rclone base image as uid 999, no network.
+      - name: Unit tests
+        run: test/unit.sh
+
+  docker:
+    name: docker build & e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build image (linux/amd64, no push)
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: dragonfly-s3-sync:ci
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke
+        run: docker run --rm dragonfly-s3-sync:ci version
+
+      - name: End-to-end (Dragonfly + fake S3)
+        env:
+          IMAGE: dragonfly-s3-sync:ci
+        run: test/e2e.sh

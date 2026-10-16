@@ -1,0 +1,132 @@
+#!/bin/sh
+# dragonfly-s3-sync: restore Dragonfly snapshots from an rclone remote into an
+# empty volume (restore) and mirror fresh snapshots back to it (backup).
+# See README.md for configuration.
+# Never log REMOTE: an rclone connection-string remote can carry credentials.
+set -eu
+
+log() { echo "dragonfly-s3-sync: $*"; }
+err() { echo "dragonfly-s3-sync: $*" >&2; }
+die() { err "$*"; exit 1; }
+
+usage() {
+  echo "usage: dragonfly-s3-sync restore|backup|backup-once|version" >&2
+  exit 2
+}
+
+is_uint() { case $1 in '' | *[!0-9]*) return 1 ;; esac; }
+
+config() {
+  [ -n "${REMOTE:-}" ] || die "REMOTE is required (rclone path, e.g. s3:bucket/prefix/)"
+  # Exactly one trailing slash: strip them all, add one back.
+  REMOTE="${REMOTE%"${REMOTE##*[!/]}"}/"
+  DATA_DIR="${DATA_DIR:-/data}"
+  DBFILENAME="${DBFILENAME:-snapshot}"
+  BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-600}"
+  POLL_SECONDS="${POLL_SECONDS:-60}"
+
+  [ -d "$DATA_DIR" ] || die "DATA_DIR $DATA_DIR is not a directory"
+  # Fixed names only: Dragonfly never deletes old snapshots, so {timestamp} names fill the volume.
+  # The name also goes into rclone filter globs, where other characters would be patterns.
+  case $DBFILENAME in
+    '' | *[!A-Za-z0-9_-]*) die "DBFILENAME must be a fixed name matching [A-Za-z0-9_-]+, the same as Dragonfly --dbfilename (got '$DBFILENAME')" ;;
+  esac
+  is_uint "$BACKUP_INTERVAL_SECONDS" || die "BACKUP_INTERVAL_SECONDS must be a non-negative integer"
+  is_uint "$POLL_SECONDS" || die "POLL_SECONDS must be a positive integer"
+  [ "$POLL_SECONDS" -gt 0 ] || die "POLL_SECONDS must be a positive integer"
+
+  SUMMARY="$DBFILENAME-summary.dfs"
+}
+
+restore() {
+  if [ -e "$DATA_DIR/$SUMMARY" ]; then
+    log "volume already has a snapshot — skip restore"
+    exit 0
+  fi
+
+  # Separate assignment: a listing error (network, auth, DNS) must fail, never look like "no backups".
+  if ! listing=$(rclone lsf --files-only "$REMOTE"); then
+    die "listing failed"
+  fi
+  if ! printf '%s\n' "$listing" | grep -Fqx "$SUMMARY"; then
+    log "no backups — fresh volume"
+    exit 0
+  fi
+
+  # Shards first, summary last: an interrupted copy must leave no summary, or the retry
+  # skips and Dragonfly silently loads a partial dataset (it does not error on missing shards).
+  # sync: Dragonfly loads every <name>-????.dfs, so stray local shards must go.
+  # --inplace: a killed copy must not leave shard-sized .partial files filling the volume.
+  rclone sync --inplace "$REMOTE" "$DATA_DIR" --include "/$DBFILENAME-[0-9]*.dfs" || die "restore failed"
+  # Not in place: the summary must appear atomically.
+  rclone copyto "$REMOTE$SUMMARY" "$DATA_DIR/$SUMMARY" || die "restore failed"
+  log "restore ok"
+}
+
+fingerprint() { stat -c '%n %Y %s' "$DATA_DIR/$DBFILENAME"-*.dfs 2>/dev/null || :; }
+
+# One backup attempt. 0 = uploaded or nothing to do, 1 = retry next tick.
+# Sets LAST_OK only after an upload. Never writes to DATA_DIR (read-only in the sidecar).
+attempt() {
+  if ! mtime=$(stat -c %Y "$DATA_DIR/$SUMMARY" 2>/dev/null); then
+    log "no snapshot yet — skip"
+    return 0
+  fi
+  # Files from before this Dragonfly started may be a partial restore; uploading them once deleted a good shard.
+  if [ "$mtime" -le "$STARTED" ]; then
+    log "no snapshot saved since start — skip"
+    return 0
+  fi
+  # Dragonfly writes <name>-*.dfs.tmp and renames when done.
+  for f in "$DATA_DIR"/*.tmp; do
+    if [ -e "$f" ]; then
+      log "save in progress — retry next tick"
+      return 1
+    fi
+  done
+
+  before=$(fingerprint)
+  # sync, not copy: drops stale shards in the remote when the shard count changes.
+  if ! rclone sync "$DATA_DIR" "$REMOTE" --include "/$DBFILENAME-*.dfs"; then
+    err "backup failed"
+    return 1
+  fi
+  if [ "$(fingerprint)" != "$before" ]; then
+    log "snapshot changed while uploading — retry next tick"
+    return 1
+  fi
+  LAST_OK=$(date +%s)
+  log "backup ok"
+}
+
+backup() {
+  trap 'exit 0' TERM INT
+  STARTED=$(date +%s)
+  LAST_OK=
+  log "backup loop started: every ${BACKUP_INTERVAL_SECONDS}s, tick ${POLL_SECONDS}s"
+  while :; do
+    if [ -z "$LAST_OK" ] || [ $(($(date +%s) - LAST_OK)) -ge "$BACKUP_INTERVAL_SECONDS" ]; then
+      attempt || :
+    fi
+    sleep "$POLL_SECONDS" &
+    wait $!
+  done
+}
+
+backup_once() {
+  STARTED="${STARTED_AT:-$(date +%s)}"
+  is_uint "$STARTED" || die "STARTED_AT must be epoch seconds"
+  if attempt; then exit 0; else exit 1; fi
+}
+
+[ $# -eq 1 ] || usage
+case $1 in
+  restore) config; restore ;;
+  backup) config; backup ;;
+  backup-once) config; backup_once ;;
+  version)
+    echo "dragonfly-s3-sync ${DRAGONFLY_S3_SYNC_VERSION:-dev} (${DRAGONFLY_S3_SYNC_COMMIT:-unknown})"
+    rclone version | head -n 1
+    ;;
+  *) usage ;;
+esac
